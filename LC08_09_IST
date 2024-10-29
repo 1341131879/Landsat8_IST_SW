@@ -1,0 +1,107 @@
+import os
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+
+root_dir = r'E:\\2024seaicelandsat'  # 替换为你的文件夹路径
+
+def apply_radiometric_correction(band_data, band_type, satellite):
+    if satellite == 'LC08':  # Landsat 8
+        if band_type == 'B10':
+            return band_data * 3.3420E-04 + 0.10000
+        elif band_type == 'B11':
+            return band_data * 3.3420E-04 + 0.10000
+    elif satellite == 'LC09':  # Landsat 9
+        if band_type == 'B10':
+            return band_data * 3.8000E-04 + 0.10000
+        elif band_type == 'B11':
+            return band_data * 3.4900E-04 + 0.10000
+    else:
+        raise ValueError("未知的卫星类型")
+
+def convert_to_brightness_temperature(band_data, band_type, satellite):
+    # 创建掩码，忽略nodata值（假设为0）
+    mask = band_data > 0
+    valid_band_data = band_data[mask]
+
+    # 应用辐射校正
+    corrected_band_data = apply_radiometric_correction(band_data, band_type, satellite)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        temp = np.zeros_like(band_data, dtype=np.float32)
+        temp[mask] = np.where(band_type == 'B10',
+                               1321.08 / np.log(774.89 / corrected_band_data[mask] + 1),
+                               1201.14 / np.log(480.89 / corrected_band_data[mask] + 1))
+
+        # 处理无效值
+        temp[np.isnan(temp)] = 0
+        temp[np.isinf(temp)] = 0
+        return temp
+
+def calculate_surface_temperature(b10_temp, b11_temp):
+    valid_mask = (b10_temp > 0) & (b11_temp > 0)
+    surface_temp = np.zeros_like(b10_temp, dtype=np.float32)
+
+    surface_temp[valid_mask] = (-0.41165 +
+                                (1.00522 + 0.14543 * ((float(1) - 0.984) / 0.984) +
+                                  (-0.27297) * 0.012 / 0.984 / 0.984) * (b10_temp[valid_mask] + b11_temp[valid_mask]) / 2 +
+                                 (4.06655 + (-6.92512) * (float(1) - 0.984) / 0.984 +
+                                  (-18.27461) * 0.012 / 0.984 / 0.984) * (b10_temp[valid_mask] - b11_temp[valid_mask]) / 2 +
+                                 0.24468 * (b10_temp[valid_mask] - b11_temp[valid_mask]) * (b10_temp[valid_mask] - b11_temp[valid_mask]))
+
+    return surface_temp
+
+def save_geotiff(data, filepath, profile):
+    with rasterio.open(filepath, 'w', **profile) as dst:
+        dst.write(data, 1)
+
+for foldername in os.listdir(root_dir):
+    folder_path = os.path.join(root_dir, foldername)
+    if os.path.isdir(folder_path):
+        b10_path = os.path.join(folder_path, f'{foldername}_B10.TIF')
+        b11_path = os.path.join(folder_path, f'{foldername}_B11.TIF')
+
+        if os.path.exists(b10_path) and os.path.exists(b11_path):
+            # 确定卫星类型
+            satellite_type = foldername[:4]
+
+            with rasterio.open(b10_path) as b10_file:
+                b10_data = b10_file.read(1).astype(np.float32)  # 转换为浮点型
+                profile = b10_file.profile.copy()
+
+            with rasterio.open(b11_path) as b11_file:
+                b11_data = b11_file.read(1).astype(np.float32)  # 转换为浮点型
+
+            # 调试输出波段数据
+            print(f"{foldername} B10 数据统计: 最小值={np.min(b10_data)}, 最大值={np.max(b10_data)}")
+            print(f"{foldername} B11 数据统计: 最小值={np.min(b11_data)}, 最大值={np.max(b11_data)}")
+
+            b10_temp = convert_to_brightness_temperature(b10_data, 'B10', satellite_type)
+            b11_temp = convert_to_brightness_temperature(b11_data, 'B11', satellite_type)
+
+            # 调试输出亮温
+            print(f"{foldername} B10 亮温统计: 最小值={np.min(b10_temp)}, 最大值={np.max(b10_temp)}")
+            print(f"{foldername} B11 亮温统计: 最小值={np.min(b11_temp)}, 最大值={np.max(b11_temp)}")
+
+            surface_temp = calculate_surface_temperature(b10_temp, b11_temp)
+
+            output_filepath = os.path.join(folder_path, f'{foldername}_Surface_Temperature.tif')
+
+            profile.update({
+                'driver': 'GTiff',
+                'dtype': 'float32',
+                'crs': 'EPSG:3413',
+                'transform': from_origin(profile['transform'][2], profile['transform'][3], profile['transform'][0],
+                                         profile['transform'][1]),
+                'height': surface_temp.shape[0],
+                'width': surface_temp.shape[1],
+                'count': 1,
+            })
+
+            save_geotiff(surface_temp, output_filepath, profile)
+
+            print(f"{foldername} 的表面温度已保存为: {output_filepath}")
+        else:
+            print(f"缺少 B10 或 B11 文件在 {foldername}")
+
+print("所有文件处理完成！")
